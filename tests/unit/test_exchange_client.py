@@ -29,6 +29,8 @@ class TestExchangeClientInit:
         mock_settings.BINANCE_API_SECRET = 'test_' + 'y' * 60
         mock_settings.DEBUG_MODE = False
         mock_settings.SAVINGS_PRECISIONS = {'DEFAULT': 2}
+        mock_settings.EXCHANGE = 'binance'
+        mock_settings.TESTNET_MODE = False
 
         with patch.dict('os.environ', {}, clear=True):
             client = ExchangeClient()
@@ -47,6 +49,8 @@ class TestExchangeClientInit:
         mock_settings.BINANCE_API_SECRET = 'test_' + 'y' * 60
         mock_settings.DEBUG_MODE = False
         mock_settings.SAVINGS_PRECISIONS = {'DEFAULT': 2}
+        mock_settings.EXCHANGE = 'binance'
+        mock_settings.TESTNET_MODE = False
 
         client = ExchangeClient()
 
@@ -66,6 +70,8 @@ class TestMarketData:
             mock_settings.BINANCE_API_SECRET = 'test_' + 'y' * 60
             mock_settings.DEBUG_MODE = False
             mock_settings.SAVINGS_PRECISIONS = {'DEFAULT': 2}
+            mock_settings.EXCHANGE = 'binance'
+            mock_settings.TESTNET_MODE = False
 
             with patch('src.core.exchange_client.ccxt.binance'):
                 client = ExchangeClient()
@@ -147,6 +153,8 @@ class TestBalance:
             mock_settings.DEBUG_MODE = False
             mock_settings.SAVINGS_PRECISIONS = {'DEFAULT': 2}
             mock_settings.ENABLE_SAVINGS_FUNCTION = True
+            mock_settings.EXCHANGE = 'binance'
+            mock_settings.TESTNET_MODE = False
 
             with patch('src.core.exchange_client.ccxt.binance'):
                 client = ExchangeClient()
@@ -185,33 +193,22 @@ class TestBalance:
             assert mock_client.funding_balance_cache['data'] == {}
 
     @pytest.mark.asyncio
-    async def test_fetch_funding_balance_pagination(self, mock_client):
-        """测试理财余额分页获取"""
-        # 模拟分页数据 - 第一页有100条(触发分页),第二页少于100条(结束)
-        mock_page1 = {
-            'rows': [
-                {'asset': 'USDT', 'totalAmount': '500.0'},
-                {'asset': 'BNB', 'totalAmount': '5.0'}
-            ] + [{'asset': 'FILLER', 'totalAmount': '1.0'}] * 98  # 补齐到100条
-        }
-        mock_page2 = {
-            'rows': [
-                {'asset': 'USDT', 'totalAmount': '300.0'},
-                {'asset': 'ETH', 'totalAmount': '2.0'}
-            ]  # 少于100条,触发结束条件
-        }
+    async def test_fetch_funding_balance_alpha(self, mock_client):
+        """测试 Alpha 资产余额获取"""
+        mock_assets = [
+            {'cexAssetCode': 'USDT', 'amount': '800'},
+            {'alphaId': 'ALPHA_1', 'amount': '12.5'},
+            {'cexAssetCode': 'ZERO', 'amount': '0'},
+        ]
 
-        mock_client.exchange.sapi_get_simple_earn_flexible_position = AsyncMock(
-            side_effect=[mock_page1, mock_page2]
-        )
+        mock_client.exchange.request = AsyncMock(return_value=mock_assets)
 
         balance = await mock_client.fetch_funding_balance()
 
-        # 验证余额合并
-        assert balance['USDT'] == 800.0  # 500 + 300
-        assert balance['BNB'] == 5.0
-        assert balance['ETH'] == 2.0
-        assert balance['FILLER'] == 98.0  # 98条填充数据
+        mock_client.exchange.request.assert_called_once()
+        args = mock_client.exchange.request.call_args[0]
+        assert args[0] == 'v1/asset/get-alpha-asset'
+        assert balance == {'USDT': 800.0, 'ALPHA_1': 12.5}
 
 
 class TestOrders:
@@ -225,6 +222,8 @@ class TestOrders:
             mock_settings.BINANCE_API_SECRET = 'test_' + 'y' * 60
             mock_settings.DEBUG_MODE = False
             mock_settings.SAVINGS_PRECISIONS = {'DEFAULT': 2}
+            mock_settings.EXCHANGE = 'binance'
+            mock_settings.TESTNET_MODE = False
 
             with patch('src.core.exchange_client.ccxt.binance'):
                 client = ExchangeClient()
@@ -298,6 +297,8 @@ class TestSavingsOperations:
             mock_settings.BINANCE_API_SECRET = 'test_' + 'y' * 60
             mock_settings.DEBUG_MODE = False
             mock_settings.SAVINGS_PRECISIONS = {'USDT': 2, 'BNB': 4, 'DEFAULT': 2}
+            mock_settings.EXCHANGE = 'binance'
+            mock_settings.TESTNET_MODE = False
 
             with patch('src.core.exchange_client.ccxt.binance'):
                 client = ExchangeClient()
@@ -306,53 +307,66 @@ class TestSavingsOperations:
                 yield client
 
     @pytest.mark.asyncio
-    async def test_get_flexible_product_id(self, mock_client):
-        """测试获取理财产品ID"""
-        mock_products = {
-            'rows': [
-                {'asset': 'USDT', 'productId': 'USDT001', 'status': 'PURCHASING'},
-                {'asset': 'BNB', 'productId': 'BNB001', 'status': 'SOLD_OUT'}
+    async def test_transfer_to_savings(self, mock_client):
+        """测试 Alpha 买入"""
+        exchange_info = {
+            'symbols': [
+                {
+                    'symbol': 'ALPHA_1USDT',
+                    'status': 'TRADING',
+                    'baseAsset': 'ALPHA_1',
+                    'quoteAsset': 'USDT',
+                    'pricePrecision': 4,
+                    'quantityPrecision': 3,
+                }
             ]
         }
 
-        mock_client.exchange.sapi_get_simple_earn_flexible_list = AsyncMock(
-            return_value=mock_products
-        )
-
-        product_id = await mock_client.get_flexible_product_id('USDT')
-
-        assert product_id == 'USDT001'
-
-    @pytest.mark.asyncio
-    async def test_transfer_to_savings(self, mock_client):
-        """测试申购理财"""
-        mock_client.get_flexible_product_id = AsyncMock(return_value='USDT001')
-        mock_client.exchange.sapi_post_simple_earn_flexible_subscribe = AsyncMock(
-            return_value={'success': True}
+        mock_client.exchange.request = AsyncMock(
+            side_effect=[exchange_info, {'price': '0.5000'}, {'success': True}]
         )
 
         result = await mock_client.transfer_to_savings('USDT', 1000.5)
 
         assert result['success'] is True
-        # 验证金额格式化(USDT精度为2)
-        call_params = mock_client.exchange.sapi_post_simple_earn_flexible_subscribe.call_args[0][0]
-        assert call_params['amount'] == '1000.50'
+        calls = mock_client.exchange.request.call_args_list
+        assert calls[0][0][0] == 'v1/alpha-trade/get-exchange-info'
+        assert calls[1][0][0] == 'v1/alpha-trade/market/ticker-price'
+        place_call = calls[2]
+        assert place_call[0][0] == 'v1/alpha-trade/order/place'
+        params = place_call[0][3]
+        assert params['side'] == 'BUY'
+        assert params['baseAsset'] == 'ALPHA_1'
+        assert params['quoteAsset'] == 'USDT'
 
     @pytest.mark.asyncio
     async def test_transfer_to_spot(self, mock_client):
-        """测试赎回理财"""
-        mock_client.get_flexible_product_id = AsyncMock(return_value='BNB001')
-        mock_client.exchange.sapi_post_simple_earn_flexible_redeem = AsyncMock(
-            return_value={'success': True}
+        """测试 Alpha 卖出"""
+        exchange_info = {
+            'symbols': [
+                {
+                    'symbol': 'ALPHA_2USDT',
+                    'status': 'TRADING',
+                    'baseAsset': 'ALPHA_2',
+                    'quoteAsset': 'USDT',
+                    'pricePrecision': 4,
+                    'quantityPrecision': 3,
+                }
+            ]
+        }
+
+        mock_client.exchange.request = AsyncMock(
+            side_effect=[exchange_info, {'price': '2.0000'}, {'success': True}]
         )
 
-        result = await mock_client.transfer_to_spot('BNB', 10.123456)
+        result = await mock_client.transfer_to_spot('USDT', 200.0)
 
         assert result['success'] is True
-        # 验证金额格式化(BNB精度为4)
-        call_params = mock_client.exchange.sapi_post_simple_earn_flexible_redeem.call_args[0][0]
-        assert call_params['amount'] == '10.1235'  # 四舍五入到4位小数
-
+        calls = mock_client.exchange.request.call_args_list
+        assert calls[2][0][0] == 'v1/alpha-trade/order/place'
+        params = calls[2][0][3]
+        assert params['side'] == 'SELL'
+        assert params['baseAsset'] == 'ALPHA_2'
 
 class TestTimeSync:
     """测试时间同步功能"""
@@ -365,6 +379,8 @@ class TestTimeSync:
             mock_settings.BINANCE_API_SECRET = 'test_' + 'y' * 60
             mock_settings.DEBUG_MODE = False
             mock_settings.SAVINGS_PRECISIONS = {'DEFAULT': 2}
+            mock_settings.EXCHANGE = 'binance'
+            mock_settings.TESTNET_MODE = False
 
             with patch('src.core.exchange_client.ccxt.binance'):
                 client = ExchangeClient()
@@ -425,6 +441,8 @@ class TestUtilityMethods:
                 'ETH': 6,
                 'DEFAULT': 2
             }
+            mock_settings.EXCHANGE = 'binance'
+            mock_settings.TESTNET_MODE = False
 
             with patch('src.core.exchange_client.ccxt.binance'):
                 client = ExchangeClient()
@@ -483,6 +501,8 @@ class TestCalculateTotalValue:
             mock_settings.BINANCE_API_SECRET = 'test_' + 'y' * 60
             mock_settings.DEBUG_MODE = False
             mock_settings.SAVINGS_PRECISIONS = {'DEFAULT': 2}
+            mock_settings.EXCHANGE = 'binance'
+            mock_settings.TESTNET_MODE = False
 
             with patch('src.core.exchange_client.ccxt.binance'):
                 client = ExchangeClient()
@@ -537,6 +557,8 @@ class TestAdditionalMethods:
             mock_settings.BINANCE_API_SECRET = 'test_' + 'y' * 60
             mock_settings.DEBUG_MODE = False
             mock_settings.SAVINGS_PRECISIONS = {'DEFAULT': 2}
+            mock_settings.EXCHANGE = 'binance'
+            mock_settings.TESTNET_MODE = False
 
             with patch('src.core.exchange_client.ccxt.binance'):
                 client = ExchangeClient()
@@ -659,6 +681,8 @@ class TestCacheInvalidation:
             mock_settings.DEBUG_MODE = False
             mock_settings.SAVINGS_PRECISIONS = {'DEFAULT': 2}
             mock_settings.ENABLE_SAVINGS_FUNCTION = True
+            mock_settings.EXCHANGE = 'binance'
+            mock_settings.TESTNET_MODE = False
 
             with patch('src.core.exchange_client.ccxt.binance'):
                 client = ExchangeClient()
@@ -672,9 +696,21 @@ class TestCacheInvalidation:
         mock_client.balance_cache = {'timestamp': time.time(), 'data': {'total': {'USDT': 1000.0}}}
         mock_client.funding_balance_cache = {'timestamp': time.time(), 'data': {'USDT': 500.0}}
 
-        mock_client.get_flexible_product_id = AsyncMock(return_value='USDT001')
-        mock_client.exchange.sapi_post_simple_earn_flexible_subscribe = AsyncMock(
-            return_value={'success': True}
+        exchange_info = {
+            'symbols': [
+                {
+                    'symbol': 'ALPHA_1USDT',
+                    'status': 'TRADING',
+                    'baseAsset': 'ALPHA_1',
+                    'quoteAsset': 'USDT',
+                    'pricePrecision': 4,
+                    'quantityPrecision': 4,
+                }
+            ]
+        }
+
+        mock_client.exchange.request = AsyncMock(
+            side_effect=[exchange_info, {'price': '1.0000'}, {'success': True}]
         )
 
         await mock_client.transfer_to_savings('USDT', 100.0)
@@ -690,9 +726,21 @@ class TestCacheInvalidation:
         mock_client.balance_cache = {'timestamp': time.time(), 'data': {'total': {'USDT': 1000.0}}}
         mock_client.funding_balance_cache = {'timestamp': time.time(), 'data': {'USDT': 500.0}}
 
-        mock_client.get_flexible_product_id = AsyncMock(return_value='USDT001')
-        mock_client.exchange.sapi_post_simple_earn_flexible_redeem = AsyncMock(
-            return_value={'success': True}
+        exchange_info = {
+            'symbols': [
+                {
+                    'symbol': 'ALPHA_1USDT',
+                    'status': 'TRADING',
+                    'baseAsset': 'ALPHA_1',
+                    'quoteAsset': 'USDT',
+                    'pricePrecision': 4,
+                    'quantityPrecision': 4,
+                }
+            ]
+        }
+
+        mock_client.exchange.request = AsyncMock(
+            side_effect=[exchange_info, {'price': '1.0000'}, {'success': True}]
         )
 
         await mock_client.transfer_to_spot('USDT', 100.0)
@@ -713,6 +761,8 @@ class TestEdgeCases:
             mock_settings.BINANCE_API_SECRET = 'test_' + 'y' * 60
             mock_settings.DEBUG_MODE = False
             mock_settings.SAVINGS_PRECISIONS = {'DEFAULT': 2}
+            mock_settings.EXCHANGE = 'binance'
+            mock_settings.TESTNET_MODE = False
 
             with patch('src.core.exchange_client.ccxt.binance'):
                 client = ExchangeClient()
@@ -743,20 +793,25 @@ class TestEdgeCases:
         assert balance == {'free': {}, 'used': {}, 'total': {}}
 
     @pytest.mark.asyncio
-    async def test_get_flexible_product_id_not_found(self, mock_client):
-        """测试未找到理财产品"""
-        mock_products = {
-            'rows': [
-                {'asset': 'BNB', 'productId': 'BNB001', 'status': 'SOLD_OUT'}
+    async def test_get_alpha_symbol_info_not_found(self, mock_client):
+        """测试未找到 Alpha 交易对"""
+        exchange_info = {
+            'symbols': [
+                {
+                    'symbol': 'ALPHA_XBNB',
+                    'status': 'TRADING',
+                    'baseAsset': 'ALPHA_X',
+                    'quoteAsset': 'BNB',
+                    'pricePrecision': 4,
+                    'quantityPrecision': 4,
+                }
             ]
         }
 
-        mock_client.exchange.sapi_get_simple_earn_flexible_list = AsyncMock(
-            return_value=mock_products
-        )
+        mock_client.exchange.request = AsyncMock(return_value=exchange_info)
 
-        with pytest.raises(ValueError, match="未找到USDT的可用活期理财产品"):
-            await mock_client.get_flexible_product_id('USDT')
+        with pytest.raises(ValueError, match="未找到报价资产为 USDT 的可交易 Alpha 交易对"):
+            await mock_client.get_alpha_symbol_info('USDT')
 
     @pytest.mark.asyncio
     async def test_calculate_total_account_value_with_ld_assets(self, mock_client):

@@ -84,23 +84,29 @@ def mock_ccxt_exchange():
     # 模拟订单取消
     exchange.cancel_order = AsyncMock(return_value={'id': '1001', 'status': 'canceled'})
 
-    # 模拟理财相关API
-    exchange.sapi_get_simple_earn_flexible_list = AsyncMock(return_value={
-        'rows': [{'asset': 'USDT', 'productId': 'USDT001'}]
-    })
+    async def request_side_effect(path, api, method, params=None, *args, **kwargs):
+        if path == 'v1/asset/get-alpha-asset':
+            return [{'cexAssetCode': 'USDT', 'amount': '500'}]
+        if path == 'v1/alpha-trade/get-exchange-info':
+            return {
+                'symbols': [
+                    {
+                        'symbol': 'ALPHA_1USDT',
+                        'status': 'TRADING',
+                        'baseAsset': 'ALPHA_1',
+                        'quoteAsset': 'USDT',
+                        'pricePrecision': 4,
+                        'quantityPrecision': 4,
+                    }
+                ]
+            }
+        if path == 'v1/alpha-trade/market/ticker-price':
+            return {'price': '1.0000'}
+        if path == 'v1/alpha-trade/order/place':
+            return {'orderId': 'alpha-123', 'success': True}
+        return {}
 
-    exchange.sapi_post_simple_earn_flexible_subscribe = AsyncMock(return_value={
-        'purchaseId': '12345', 'success': True
-    })
-
-    exchange.sapi_post_simple_earn_flexible_redeem = AsyncMock(return_value={
-        'redeemId': '12346', 'success': True
-    })
-
-    exchange.sapi_get_simple_earn_flexible_position = AsyncMock(return_value={
-        'rows': [{'asset': 'USDT', 'totalAmount': '500.0'}],
-        'total': 1
-    })
+    exchange.request = AsyncMock(side_effect=request_side_effect)
 
     return exchange
 

@@ -3,7 +3,7 @@
 
 提供币安交易所的完整功能支持，包括：
 - 现货交易
-- Simple Earn 理财功能
+- Alpha 2.0 流动性（替换 Simple Earn）
 - 精度处理
 - 时间同步
 
@@ -12,7 +12,6 @@
 """
 
 import ccxt.async_support as ccxt
-import asyncio
 import time
 from typing import Dict, Optional
 from src.core.exchanges.base import (
@@ -21,7 +20,6 @@ from src.core.exchanges.base import (
     ExchangeCapabilities
 )
 from src.core.exchanges.factory import ExchangeConfig
-from src.config.settings import settings
 
 
 class BinanceExchange(BaseExchange, ISavingsFeature):
@@ -30,7 +28,7 @@ class BinanceExchange(BaseExchange, ISavingsFeature):
 
     特性：
     - 完整的现货交易支持
-    - Simple Earn 理财功能
+    - Alpha 2.0 流动性操作
     - 灵活的精度处理
     - 自动时间同步
     """
@@ -45,11 +43,9 @@ class BinanceExchange(BaseExchange, ISavingsFeature):
         # 调用基类初始化
         super().__init__('binance', config)
 
-        # 币安特定配置
-        self.savings_precisions = settings.SAVINGS_PRECISIONS
-
         # 理财余额缓存
         self.funding_balance_cache = {'timestamp': 0, 'data': {}}
+        self._alpha_exchange_cache = None
 
         self.logger.info("币安交易所初始化完成")
 
@@ -88,198 +84,166 @@ class BinanceExchange(BaseExchange, ISavingsFeature):
     # ========================================================================
 
     async def fetch_funding_balance(self) -> Dict[str, float]:
-        """
-        获取币安 Simple Earn 理财余额（支持分页）
-
-        Returns:
-            dict: 资产余额映射 {'USDT': 100.0, 'BNB': 5.0}
-        """
+        """获取 Alpha 2.0 钱包余额"""
         if not self.config.enable_savings:
             return {}
 
         now = time.time()
-
-        # 缓存检查
         if now - self.funding_balance_cache['timestamp'] < self.cache_ttl:
             return self.funding_balance_cache['data']
 
-        all_balances = {}
-        current_page = 1
-        size_per_page = 100
-
         try:
-            while True:
-                params = {'current': current_page, 'size': size_per_page}
-                result = await self.exchange.sapi_get_simple_earn_flexible_position(params)
-
-                rows = result.get('rows', [])
-                if not rows:
-                    break
-
-                for item in rows:
-                    asset = item['asset']
-                    amount = float(item.get('totalAmount', 0) or 0)
-                    if asset in all_balances:
-                        all_balances[asset] += amount
-                    else:
-                        all_balances[asset] = amount
-
-                if len(rows) < size_per_page:
-                    break
-
-                current_page += 1
-                await asyncio.sleep(0.1)
-
-            # 更新缓存
-            self.funding_balance_cache = {
-                'timestamp': now,
-                'data': all_balances
+            params = {
+                'timestamp': int(time.time() * 1000 + self.time_diff),
+                'recvWindow': 5000,
             }
+            result = await self.exchange.request(
+                'v1/asset/get-alpha-asset', 'sapi', 'GET', params
+            )
 
-            self.logger.debug(f"理财余额: {all_balances}")
-            return all_balances
+            balances: Dict[str, float] = {}
+            for item in result:
+                asset_code = item.get('cexAssetCode') or item.get('alphaId')
+                if not asset_code:
+                    continue
+                amount = float(item.get('amount', 0) or 0)
+                if amount > 0:
+                    balances[asset_code] = amount
 
-        except Exception as e:
-            self.logger.error(f"获取理财余额失败: {e}")
+            self.funding_balance_cache = {'timestamp': now, 'data': balances}
+            self.logger.debug(f"Alpha 余额: {balances}")
+            return balances
+        except Exception as exc:
+            self.logger.error(f"获取 Alpha 余额失败: {exc}")
             return self.funding_balance_cache.get('data', {})
 
     async def transfer_to_savings(self, asset: str, amount: float) -> dict:
-        """
-        从现货账户申购活期理财
-
-        Args:
-            asset: 资产名称 (例如 'USDT', 'BNB')
-            amount: 申购金额
-
-        Returns:
-            dict: 操作结果
-        """
+        """通过 Alpha 2.0 买入资产以提供流动性"""
         if not self.config.enable_savings:
             raise RuntimeError("理财功能未启用")
 
         try:
-            # 获取产品ID
-            product_id = await self._get_flexible_product_id(asset)
+            symbol_info = await self._get_alpha_symbol_info(asset)
+            price_value = await self._get_alpha_ticker_price(symbol_info['symbol'])
+            if price_value <= 0:
+                raise ValueError(f"Alpha 交易对 {symbol_info['symbol']} 缺少有效价格")
 
-            # 格式化金额
-            formatted_amount = self._format_savings_amount(asset, amount)
+            quantity_value = amount / price_value
+            quantity = self._format_alpha_value(
+                quantity_value, symbol_info.get('quantityPrecision', 8)
+            )
+            price = self._format_alpha_value(
+                price_value, symbol_info.get('pricePrecision', 8)
+            )
 
             params = {
-                'asset': asset,
-                'amount': formatted_amount,
-                'productId': product_id,
-                'timestamp': int(time.time() * 1000 + self.time_diff)
+                'baseAsset': symbol_info['baseAsset'],
+                'quoteAsset': asset,
+                'side': 'BUY',
+                'quantity': quantity,
+                'price': price,
+                'timestamp': int(time.time() * 1000 + self.time_diff),
+                'recvWindow': 5000,
             }
 
-            self.logger.info(f"申购理财: {formatted_amount} {asset}")
-            result = await self.exchange.sapi_post_simple_earn_flexible_subscribe(params)
+            self.logger.info(
+                f"Alpha 买入: {quantity} {symbol_info['baseAsset']} @ {price} ({asset})"
+            )
+            result = await self.exchange.request(
+                'v1/alpha-trade/order/place', 'sapi', 'POST', params
+            )
 
-            # 清除缓存
             self._clear_balance_cache()
 
-            self.logger.info(f"申购成功: {result}")
+            self.logger.info(f"Alpha 买入成功: {result}")
             return result
-
-        except Exception as e:
-            self.logger.error(f"申购理财失败: {e}")
+        except Exception as exc:
+            self.logger.error(f"Alpha 买入失败: {exc}")
             raise
 
     async def transfer_to_spot(self, asset: str, amount: float) -> dict:
-        """
-        从活期理财赎回到现货账户
-
-        Args:
-            asset: 资产名称
-            amount: 赎回金额
-
-        Returns:
-            dict: 操作结果
-        """
+        """通过 Alpha 2.0 卖出资产回收流动性"""
         if not self.config.enable_savings:
             raise RuntimeError("理财功能未启用")
 
         try:
-            # 获取产品ID
-            product_id = await self._get_flexible_product_id(asset)
+            symbol_info = await self._get_alpha_symbol_info(asset)
+            price_value = await self._get_alpha_ticker_price(symbol_info['symbol'])
+            if price_value <= 0:
+                raise ValueError(f"Alpha 交易对 {symbol_info['symbol']} 缺少有效价格")
 
-            # 格式化金额
-            formatted_amount = self._format_savings_amount(asset, amount)
+            quantity_value = amount / price_value
+            quantity = self._format_alpha_value(
+                quantity_value, symbol_info.get('quantityPrecision', 8)
+            )
+            price = self._format_alpha_value(
+                price_value, symbol_info.get('pricePrecision', 8)
+            )
 
             params = {
-                'asset': asset,
-                'amount': formatted_amount,
-                'productId': product_id,
+                'baseAsset': symbol_info['baseAsset'],
+                'quoteAsset': asset,
+                'side': 'SELL',
+                'quantity': quantity,
+                'price': price,
                 'timestamp': int(time.time() * 1000 + self.time_diff),
-                'redeemType': 'FAST'  # 快速赎回
+                'recvWindow': 5000,
             }
 
-            self.logger.info(f"赎回理财: {formatted_amount} {asset}")
-            result = await self.exchange.sapi_post_simple_earn_flexible_redeem(params)
+            self.logger.info(
+                f"Alpha 卖出: {quantity} {symbol_info['baseAsset']} @ {price} ({asset})"
+            )
+            result = await self.exchange.request(
+                'v1/alpha-trade/order/place', 'sapi', 'POST', params
+            )
 
-            # 清除缓存
             self._clear_balance_cache()
 
-            self.logger.info(f"赎回成功: {result}")
+            self.logger.info(f"Alpha 卖出成功: {result}")
             return result
-
-        except Exception as e:
-            self.logger.error(f"赎回理财失败: {e}")
+        except Exception as exc:
+            self.logger.error(f"Alpha 卖出失败: {exc}")
             raise
 
     # ========================================================================
     # 币安特定辅助方法
     # ========================================================================
 
-    async def _get_flexible_product_id(self, asset: str) -> str:
-        """
-        获取指定资产的活期理财产品ID
-
-        Args:
-            asset: 资产名称
-
-        Returns:
-            str: 产品ID
-
-        Raises:
-            ValueError: 未找到可用产品
-        """
-        try:
+    async def _get_alpha_symbol_info(self, quote_asset: str) -> Dict[str, Any]:
+        cache = self._alpha_exchange_cache
+        now = time.time()
+        if cache and now - cache[0] < 30:
+            exchange_info = cache[1]
+        else:
             params = {
-                'asset': asset,
                 'timestamp': int(time.time() * 1000 + self.time_diff),
-                'current': 1,
-                'size': 100,
+                'recvWindow': 5000,
             }
-            result = await self.exchange.sapi_get_simple_earn_flexible_list(params)
-            products = result.get('rows', [])
+            exchange_info = await self.exchange.request(
+                'v1/alpha-trade/get-exchange-info', 'sapi', 'GET', params
+            )
+            self._alpha_exchange_cache = (now, exchange_info)
 
-            for product in products:
-                if product['asset'] == asset and product['status'] == 'PURCHASING':
-                    self.logger.debug(f"找到理财产品: {asset} -> {product['productId']}")
-                    return product['productId']
+        for symbol in exchange_info.get('symbols', []):
+            if symbol.get('quoteAsset') == quote_asset and symbol.get('status') == 'TRADING':
+                return symbol
 
-            raise ValueError(f"未找到 {asset} 的可用活期理财产品")
+        raise ValueError(f"未找到报价资产为 {quote_asset} 的 Alpha 交易对")
 
-        except Exception as e:
-            self.logger.error(f"获取理财产品ID失败: {e}")
-            raise
-
-    def _format_savings_amount(self, asset: str, amount: float) -> str:
-        """
-        根据配置格式化理财金额
-
-        Args:
-            asset: 资产名称
-            amount: 金额
-
-        Returns:
-            str: 格式化后的金额字符串
-        """
-        precision = self.savings_precisions.get(
-            asset,
-            self.savings_precisions['DEFAULT']
+    async def _get_alpha_ticker_price(self, symbol: str) -> float:
+        params = {
+            'symbol': symbol,
+            'timestamp': int(time.time() * 1000 + self.time_diff),
+            'recvWindow': 5000,
+        }
+        ticker = await self.exchange.request(
+            'v1/alpha-trade/market/ticker-price', 'sapi', 'GET', params
         )
-        return f"{float(amount):.{precision}f}"
+        return float(ticker.get('price', 0) or 0)
+
+    @staticmethod
+    def _format_alpha_value(value: float, precision: int) -> str:
+        return format(value, f'.{precision}f')
 
     def _clear_balance_cache(self):
         """清除余额缓存"""

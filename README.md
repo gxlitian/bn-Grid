@@ -354,8 +354,8 @@ ANTHROPIC_API_KEY="your_anthropic_key"
 # PushPlus 通知 Token，用于发送交易通知或警报
 PUSHPLUS_TOKEN="your_pushplus_token_here"
 
-# 是否启用自动申购/赎回理财功能 (true/false)
-# Binance: 简单储蓄 | OKX: 余币宝
+# 是否启用自动 Alpha 流动性/OKX 理财 (true/false)
+# Binance: Alpha 2.0 流动性 | OKX: 余币宝
 # 对于使用子账户API的用户，或不希望使用理财功能的用户，请设置为 false
 ENABLE_SAVINGS_FUNCTION=true
 
@@ -383,7 +383,7 @@ HTTP_PROXY=
 ```bash
 ENABLE_SAVINGS_FUNCTION=true
 ```
-- ✅ Binance: 自动申购/赎回简单储蓄
+- ✅ Binance: 自动买入/卖出 Alpha 2.0 流动性资产
 - ✅ OKX: 自动申购/赎回余币宝
 - ✅ 最大化资金利用效率
 
