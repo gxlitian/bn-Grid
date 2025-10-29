@@ -153,7 +153,7 @@ classDiagram
         +transfer_to_savings(asset, amount) Future
         +transfer_to_spot(asset, amount) Future
         +fetch_funding_balance() Future
-        -_get_flexible_product_id(asset) Future
+        -_get_alpha_symbol_info(asset) Future
         -_format_savings_amount(asset, amount) str
     }
 
@@ -281,7 +281,7 @@ class ISavingsStrategy(ABC):
 
 class BinanceSavingsStrategy(ISavingsStrategy):
     async def transfer_to_savings(self, asset: str, amount: float):
-        # Binance Simple Earn API实现
+        # Binance Alpha 2.0 API实现
         pass
 
 class OKXSavingsStrategy(ISavingsStrategy):

@@ -298,7 +298,7 @@ OKX_PASSPHRASE="zzz"
 
 不同交易所的理财API可能有差异：
 
-- **Binance**: 简单储蓄 (Simple Earn)
+- **Binance**: Alpha 2.0 流动性 (替代 Simple Earn)
 - **OKX**: 余币宝 (Savings)
 
 如果理财功能出现问题，建议禁用：

@@ -3,11 +3,12 @@
 
 实现币安交易所的完整功能，包括：
 - 现货交易
-- 简单储蓄（理财）功能
+- Alpha 2.0 流动性 (替换原 Simple Earn)
 - 账户划转
 """
 
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
+import time
 import ccxt.async_support as ccxt
 from src.core.exchange.base import (
     BaseExchangeAdapter,
@@ -23,7 +24,7 @@ class BinanceAdapter(BaseExchangeAdapter):
 
     支持功能：
     - ✅ 现货交易
-    - ✅ 简单储蓄（理财）
+    - ✅ Alpha 2.0 流动性
     - ✅ 账户划转
     """
 
@@ -42,6 +43,8 @@ class BinanceAdapter(BaseExchangeAdapter):
     async def initialize(self) -> None:
         """初始化币安连接"""
         self.logger.info("正在初始化币安交易所连接...")
+
+        self._alpha_exchange_cache = None
 
         self._exchange = ccxt.binance({
             'apiKey': self.api_key,
@@ -137,95 +140,145 @@ class BinanceAdapter(BaseExchangeAdapter):
         """加载市场信息"""
         return await self._exchange.load_markets(reload)
 
-    # ==================== 币安理财功能实现 ====================
+    # ==================== Alpha 2.0 流动性接口 ====================
 
     async def fetch_funding_balance(self) -> Dict[str, float]:
-        """
-        获取币安简单储蓄余额
-
-        使用币安 sapi/v1/simple-earn/flexible/position 接口
-        """
+        """获取 Alpha 2.0 钱包余额"""
         try:
-            self.logger.debug("获取币安理财账户余额...")
+            params = {
+                'timestamp': self._exchange.milliseconds(),
+                'recvWindow': 5000,
+            }
+            response = await self._exchange.request(
+                'v1/asset/get-alpha-asset', 'sapi', 'GET', params
+            )
 
-            # 调用币安简单储蓄API
-            response = await self._exchange.sapiGetV1SimpleEarnFlexiblePosition()
+            balances: Dict[str, float] = {}
+            for item in response:
+                code = item.get('cexAssetCode') or item.get('alphaId')
+                if not code:
+                    continue
+                amount = float(item.get('amount', 0) or 0)
+                if amount > 0:
+                    balances[code] = amount
 
-            # 解析响应
-            balances = {}
-            if 'rows' in response:
-                for item in response['rows']:
-                    asset = item.get('asset')
-                    total_amount = float(item.get('totalAmount', 0))
-                    if total_amount > 0:
-                        balances[asset] = total_amount
-
-            self.logger.debug(f"理财余额: {balances}")
             return balances
-
-        except Exception as e:
-            self.logger.error(f"获取币安理财余额失败: {e}")
+        except Exception as exc:
+            self.logger.error(f"获取 Alpha 资产余额失败: {exc}")
             return {}
 
     async def transfer_to_funding(self, asset: str, amount: float) -> bool:
-        """
-        申购币安简单储蓄
-
-        Args:
-            asset: 资产名称 (如 'USDT')
-            amount: 申购数量
-
-        Returns:
-            是否成功
-        """
+        """通过 Alpha 2.0 下单将资金转入流动性"""
         try:
-            self.logger.info(f"申购币安理财 | 资产: {asset} | 数量: {amount}")
+            base_asset, quote_asset, price, quantity = await self._build_alpha_order(
+                asset, amount
+            )
 
-            # 调用申购接口
             params = {
-                'productId': 'USDT001',  # 币安活期产品ID（需要根据实际情况调整）
-                'amount': amount,
-                'autoSubscribe': True
+                'baseAsset': base_asset,
+                'quoteAsset': quote_asset,
+                'side': 'BUY',
+                'quantity': quantity,
+                'price': price,
+                'timestamp': self._exchange.milliseconds(),
+                'recvWindow': 5000,
             }
 
-            response = await self._exchange.sapiPostV1SimpleEarnFlexibleSubscribe({
-                'asset': asset,
-                'amount': str(amount)
-            })
-
-            self.logger.info(f"✅ 申购成功 | {asset}: {amount}")
+            await self._exchange.request(
+                'v1/alpha-trade/order/place', 'sapi', 'POST', params
+            )
             return True
-
-        except Exception as e:
-            self.logger.error(f"申购币安理财失败: {e}")
+        except Exception as exc:
+            self.logger.error(f"Alpha 下单失败（BUY）: {exc}")
             return False
 
     async def transfer_to_spot(self, asset: str, amount: float) -> bool:
-        """
-        从币安简单储蓄赎回到现货
-
-        Args:
-            asset: 资产名称
-            amount: 赎回数量
-
-        Returns:
-            是否成功
-        """
+        """通过 Alpha 2.0 下单将资金转回现货"""
         try:
-            self.logger.info(f"赎回币安理财 | 资产: {asset} | 数量: {amount}")
+            base_asset, quote_asset, price, quantity = await self._build_alpha_order(
+                asset, amount
+            )
 
-            # 调用赎回接口
-            response = await self._exchange.sapiPostV1SimpleEarnFlexibleRedeem({
-                'asset': asset,
-                'amount': str(amount)
-            })
+            params = {
+                'baseAsset': base_asset,
+                'quoteAsset': quote_asset,
+                'side': 'SELL',
+                'quantity': quantity,
+                'price': price,
+                'timestamp': self._exchange.milliseconds(),
+                'recvWindow': 5000,
+            }
 
-            self.logger.info(f"✅ 赎回成功 | {asset}: {amount}")
+            await self._exchange.request(
+                'v1/alpha-trade/order/place', 'sapi', 'POST', params
+            )
             return True
-
-        except Exception as e:
-            self.logger.error(f"赎回币安理财失败: {e}")
+        except Exception as exc:
+            self.logger.error(f"Alpha 下单失败（SELL）: {exc}")
             return False
+
+    async def get_alpha_exchange_info(self) -> Dict[str, Any]:
+        """获取 Alpha 交易所信息"""
+        cache = getattr(self, '_alpha_exchange_cache', None)
+        now = time.time()
+        if cache and now - cache[0] < 30:
+            return cache[1]
+
+        params = {
+            'timestamp': self._exchange.milliseconds(),
+            'recvWindow': 5000,
+        }
+        info = await self._exchange.request(
+            'v1/alpha-trade/get-exchange-info', 'sapi', 'GET', params
+        )
+        self._alpha_exchange_cache = (now, info)
+        return info
+
+    async def get_alpha_ticker_price(self, symbol: str) -> float:
+        """获取 Alpha 交易对的最新价格"""
+        params = {
+            'symbol': symbol,
+            'timestamp': self._exchange.milliseconds(),
+            'recvWindow': 5000,
+        }
+        ticker = await self._exchange.request(
+            'v1/alpha-trade/market/ticker-price', 'sapi', 'GET', params
+        )
+        return float(ticker.get('price', 0) or 0)
+
+    async def _build_alpha_order(self, quote_asset: str, amount: float) -> Tuple[str, str, str, str]:
+        """根据报价资产和金额构建 Alpha 下单信息"""
+        exchange_info = await self.get_alpha_exchange_info()
+        symbols = exchange_info.get('symbols', [])
+        symbol_info = next(
+            (
+                s for s in symbols
+                if s.get('quoteAsset') == quote_asset and s.get('status') == 'TRADING'
+            ),
+            None,
+        )
+
+        if not symbol_info:
+            raise ValueError(f"未找到可交易的 Alpha 交易对（quote={quote_asset}）")
+
+        symbol_name = symbol_info['symbol']
+        price_value = await self.get_alpha_ticker_price(symbol_name)
+        if price_value <= 0:
+            raise ValueError(f"Alpha 交易对 {symbol_name} 缺少有效价格")
+
+        quantity_value = amount / price_value
+        price = self._format_with_precision(
+            price_value, symbol_info.get('pricePrecision', 8)
+        )
+        quantity = self._format_with_precision(
+            quantity_value, symbol_info.get('quantityPrecision', 8)
+        )
+
+        return symbol_info['baseAsset'], quote_asset, price, quantity
+
+    @staticmethod
+    def _format_with_precision(value: float, precision: int) -> str:
+        return format(value, f'.{precision}f')
 
     # ==================== 币安特定工具方法 ====================
 

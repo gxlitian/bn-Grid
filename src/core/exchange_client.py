@@ -128,6 +128,7 @@ class ExchangeClient:
 
         # 【新增】用于管理后台时间同步任务
         self.time_sync_task = None
+        self._alpha_exchange_cache = None
     
 
 
@@ -249,35 +250,22 @@ class ExchangeClient:
         try:
             # 根据交易所类型调用不同的API
             if self.exchange_name == 'binance':
-                # Binance Simple Earn API（支持分页）
-                current_page = 1
-                size_per_page = 100  # 使用API允许的最大值以减少请求次数
+                params = {
+                    'timestamp': int(time.time() * 1000 + self.time_diff),
+                    'recvWindow': 5000,
+                }
+                result = await self.exchange.request(
+                    'v1/asset/get-alpha-asset', 'sapi', 'GET', params
+                )
+                self.logger.debug(f"Alpha 资产原始数据: {result}")
 
-                while True:
-                    params = {'current': current_page, 'size': size_per_page}
-                    # 使用Simple Earn API，并传入分页参数
-                    result = await self.exchange.sapi_get_simple_earn_flexible_position(params)
-                    self.logger.debug(f"理财账户原始数据 (Page {current_page}): {result}")
-
-                    rows = result.get('rows', [])
-                    if not rows:
-                        # 如果当前页没有数据，说明已经获取完毕
-                        break
-
-                    for item in rows:
-                        asset = item['asset']
-                        amount = float(item.get('totalAmount', 0) or 0)
-                        if asset in all_balances:
-                            all_balances[asset] += amount
-                        else:
-                            all_balances[asset] = amount
-
-                    # 如果当前页返回的记录数小于每页大小，说明是最后一页
-                    if len(rows) < size_per_page:
-                        break
-
-                    current_page += 1
-                    await asyncio.sleep(0.1)  # 避免请求过于频繁
+                for item in result:
+                    asset = item.get('cexAssetCode') or item.get('alphaId')
+                    if not asset:
+                        continue
+                    amount = float(item.get('amount', 0) or 0)
+                    if amount > 0:
+                        all_balances[asset] = amount
 
             elif self.exchange_name == 'okx':
                 # OKX资金账户余额查询
@@ -423,54 +411,80 @@ class ExchangeClient:
             self.logger.error(f"获取订单簿失败: {str(e)}")
             raise
 
-    async def get_flexible_product_id(self, asset):
-        """获取指定资产的活期理财产品ID（仅Binance需要）"""
+    async def get_alpha_symbol_info(self, quote_asset):
+        """获取 Alpha 交易对信息（按报价资产匹配）"""
         if self.exchange_name != 'binance':
-            # OKX不需要产品ID
             return None
 
-        try:
+        cache = getattr(self, '_alpha_exchange_cache', None)
+        now = time.time()
+        if cache and now - cache[0] < 30:
+            exchange_info = cache[1]
+        else:
             params = {
-                'asset': asset,
                 'timestamp': int(time.time() * 1000 + self.time_diff),
-                'current': 1,  # 当前页
-                'size': 100,   # 每页数量
+                'recvWindow': 5000,
             }
-            result = await self.exchange.sapi_get_simple_earn_flexible_list(params)
-            products = result.get('rows', [])
+            exchange_info = await self.exchange.request(
+                'v1/alpha-trade/get-exchange-info', 'sapi', 'GET', params
+            )
+            self._alpha_exchange_cache = (now, exchange_info)
 
-            # 查找对应资产的活期理财产品
-            for product in products:
-                if product['asset'] == asset and product['status'] == 'PURCHASING':
-                    self.logger.info(f"找到{asset}活期理财产品: {product['productId']}")
-                    return product['productId']
+        symbols = exchange_info.get('symbols', [])
+        for symbol in symbols:
+            if symbol.get('quoteAsset') == quote_asset and symbol.get('status') == 'TRADING':
+                return symbol
 
-            raise ValueError(f"未找到{asset}的可用活期理财产品")
-        except Exception as e:
-            self.logger.error(f"获取活期理财产品失败: {str(e)}")
-            raise
+        raise ValueError(f"未找到报价资产为 {quote_asset} 的可交易 Alpha 交易对")
+
+    async def _get_alpha_ticker_price(self, symbol: str) -> float:
+        params = {
+            'symbol': symbol,
+            'timestamp': int(time.time() * 1000 + self.time_diff),
+            'recvWindow': 5000,
+        }
+        ticker = await self.exchange.request(
+            'v1/alpha-trade/market/ticker-price', 'sapi', 'GET', params
+        )
+        return float(ticker.get('price', 0) or 0)
+
+    @staticmethod
+    def _format_alpha_value(value: float, precision: int) -> str:
+        return format(value, f'.{precision}f')
 
     async def transfer_to_spot(self, asset, amount):
         """从理财账户赎回/转账到现货账户（支持多交易所）"""
         try:
             if self.exchange_name == 'binance':
-                # Binance: 从活期理财赎回
-                # 获取产品ID
-                product_id = await self.get_flexible_product_id(asset)
+                symbol_info = await self.get_alpha_symbol_info(asset)
+                price_value = await self._get_alpha_ticker_price(symbol_info['symbol'])
+                if price_value <= 0:
+                    raise ValueError(f"Alpha 交易对 {symbol_info['symbol']} 缺少有效价格")
 
-                # 使用配置化的精度格式化金额
-                formatted_amount = self._format_savings_amount(asset, amount)
+                quantity_value = amount / price_value
+                quantity = self._format_alpha_value(
+                    quantity_value, symbol_info.get('quantityPrecision', 8)
+                )
+                price = self._format_alpha_value(
+                    price_value, symbol_info.get('pricePrecision', 8)
+                )
 
                 params = {
-                    'asset': asset,
-                    'amount': formatted_amount,
-                    'productId': product_id,
+                    'baseAsset': symbol_info['baseAsset'],
+                    'quoteAsset': asset,
+                    'side': 'SELL',
+                    'quantity': quantity,
+                    'price': price,
                     'timestamp': int(time.time() * 1000 + self.time_diff),
-                    'redeemType': 'FAST'  # 快速赎回
+                    'recvWindow': 5000,
                 }
-                self.logger.info(f"开始赎回: {formatted_amount} {asset} 到现货")
-                result = await self.exchange.sapi_post_simple_earn_flexible_redeem(params)
-                self.logger.info(f"赎回成功: {result}")
+                self.logger.info(
+                    f"通过 Alpha 卖出: {quantity} {symbol_info['baseAsset']} @ {price} ({asset})"
+                )
+                result = await self.exchange.request(
+                    'v1/alpha-trade/order/place', 'sapi', 'POST', params
+                )
+                self.logger.info(f"Alpha 卖出成功: {result}")
 
             elif self.exchange_name == 'okx':
                 # OKX: 从资金账户转回交易账户
@@ -505,22 +519,35 @@ class ExchangeClient:
         """从现货账户转入理财账户（支持多交易所）"""
         try:
             if self.exchange_name == 'binance':
-                # Binance: 申购活期理财
-                # 获取产品ID
-                product_id = await self.get_flexible_product_id(asset)
+                symbol_info = await self.get_alpha_symbol_info(asset)
+                price_value = await self._get_alpha_ticker_price(symbol_info['symbol'])
+                if price_value <= 0:
+                    raise ValueError(f"Alpha 交易对 {symbol_info['symbol']} 缺少有效价格")
 
-                # 使用配置化的精度格式化金额
-                formatted_amount = self._format_savings_amount(asset, amount)
+                quantity_value = amount / price_value
+                quantity = self._format_alpha_value(
+                    quantity_value, symbol_info.get('quantityPrecision', 8)
+                )
+                price = self._format_alpha_value(
+                    price_value, symbol_info.get('pricePrecision', 8)
+                )
 
                 params = {
-                    'asset': asset,
-                    'amount': formatted_amount,
-                    'productId': product_id,
-                    'timestamp': int(time.time() * 1000 + self.time_diff)
+                    'baseAsset': symbol_info['baseAsset'],
+                    'quoteAsset': asset,
+                    'side': 'BUY',
+                    'quantity': quantity,
+                    'price': price,
+                    'timestamp': int(time.time() * 1000 + self.time_diff),
+                    'recvWindow': 5000,
                 }
-                self.logger.info(f"开始申购: {formatted_amount} {asset} 到活期理财")
-                result = await self.exchange.sapi_post_simple_earn_flexible_subscribe(params)
-                self.logger.info(f"申购成功: {result}")
+                self.logger.info(
+                    f"通过 Alpha 买入: {quantity} {symbol_info['baseAsset']} @ {price} ({asset})"
+                )
+                result = await self.exchange.request(
+                    'v1/alpha-trade/order/place', 'sapi', 'POST', params
+                )
+                self.logger.info(f"Alpha 买入成功: {result}")
 
             elif self.exchange_name == 'okx':
                 # OKX: 从交易账户转入资金账户
